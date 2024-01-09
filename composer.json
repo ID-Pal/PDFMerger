@@ -1,6 +1,6 @@
 {
     "name": "id-pal/pdfmerger",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "description": "PDFMerger for PHP",
     "keywords": ["PHP", "PDF"],
     "homepage": "https://github.com/ID-Pal/PDFMerger",
