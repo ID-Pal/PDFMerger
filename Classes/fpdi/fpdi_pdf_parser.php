@@ -109,16 +109,43 @@ class fpdi_pdf_parser extends pdf_parser
     {
         return $this->_getPageResources($this->_pages[$this->pageNo]);
     }
-    
+
+    /**
+     * Build a "objNum.genNum" cycle key for a resolved object, or null when
+     * the object is inline (not resolved through an OBJREF).
+     *
+     * @param array $obj A resolved object as returned by {@see resolveObject()}.
+     * @return string|null
+     */
+    private function _pageObjectKey($obj)
+    {
+        if (is_array($obj) && isset($obj['obj']) && isset($obj['gen'])) {
+            return $obj['obj'] . '.' . $obj['gen'];
+        }
+        return null;
+    }
+
     /**
      * Get page-resources from a /Page dictionary.
      *
      * @param array $obj Array of pdf-data
+     * @param array $visited Object keys already visited on this /Parent chain.
      * @return array|boolean
+     * @throws pdf_parser_resource_exception When a /Parent cycle is detected.
      */
-    protected function _getPageResources($obj)
+    protected function _getPageResources($obj, array $visited = array())
     {
         $obj = $this->resolveObject($obj);
+
+        $key = $this->_pageObjectKey($obj);
+        if ($key !== null) {
+            if (isset($visited[$key])) {
+                throw new pdf_parser_resource_exception(sprintf(
+                    '_getPageResources cyclic /Parent chain at object %s', $key
+                ));
+            }
+            $visited[$key] = true;
+        }
 
         // If the current object has a resources
         // dictionary associated with it, we use
@@ -135,7 +162,7 @@ class fpdi_pdf_parser extends pdf_parser
             return false;
         }
 
-        $res = $this->_getPageResources($obj[1][1]['/Parent']);
+        $res = $this->_getPageResources($obj[1][1]['/Parent'], $visited);
         if ($res[0] == pdf_parser::TYPE_OBJECT)
             return $res[1];
         return $res;
@@ -199,9 +226,20 @@ class fpdi_pdf_parser extends pdf_parser
      *
      * @return array|boolean
      */
-    protected function _getPageBox($page, $boxIndex, $k)
+    protected function _getPageBox($page, $boxIndex, $k, array $visited = array())
     {
         $page = $this->resolveObject($page);
+
+        $key = $this->_pageObjectKey($page);
+        if ($key !== null) {
+            if (isset($visited[$key])) {
+                throw new pdf_parser_resource_exception(sprintf(
+                    '_getPageBox cyclic /Parent chain at object %s', $key
+                ));
+            }
+            $visited[$key] = true;
+        }
+
         $box = null;
         if (isset($page[1][1][$boxIndex])) {
             $box = $page[1][1][$boxIndex];
@@ -227,7 +265,7 @@ class fpdi_pdf_parser extends pdf_parser
         } else if (!isset($page[1][1]['/Parent'])) {
             return false;
         } else {
-            return $this->_getPageBox($this->resolveObject($page[1][1]['/Parent']), $boxIndex, $k);
+            return $this->_getPageBox($this->resolveObject($page[1][1]['/Parent']), $boxIndex, $k, $visited);
         }
     }
 
@@ -288,11 +326,24 @@ class fpdi_pdf_parser extends pdf_parser
      * Get the rotation value of a page
      *
      * @param array $obj A /Page dictionary
+     * @param array $visited Object keys already visited on this /Parent chain.
      * @return array|bool
+     * @throws pdf_parser_resource_exception When a /Parent cycle is detected.
      */
-    protected function _getPageRotation($obj)
+    protected function _getPageRotation($obj, array $visited = array())
     {
         $obj = $this->resolveObject($obj);
+
+        $key = $this->_pageObjectKey($obj);
+        if ($key !== null) {
+            if (isset($visited[$key])) {
+                throw new pdf_parser_resource_exception(sprintf(
+                    '_getPageRotation cyclic /Parent chain at object %s', $key
+                ));
+            }
+            $visited[$key] = true;
+        }
+
         if (isset($obj[1][1]['/Rotate'])) {
             $res = $this->resolveObject($obj[1][1]['/Rotate']);
             if ($res[0] == pdf_parser::TYPE_OBJECT)
@@ -304,7 +355,7 @@ class fpdi_pdf_parser extends pdf_parser
             return false;
         }
 
-        $res = $this->_getPageRotation($obj[1][1]['/Parent']);
+        $res = $this->_getPageRotation($obj[1][1]['/Parent'], $visited);
         if(false == $res) return false;
         if ($res[0] == pdf_parser::TYPE_OBJECT)
             return $res[1];
@@ -317,10 +368,22 @@ class fpdi_pdf_parser extends pdf_parser
      *
      * @param array $pages /Pages dictionary
      * @param array $result The result array
+     * @param array $visited Object keys already visited on this /Kids chain.
      * @throws Exception
+     * @throws pdf_parser_resource_exception When a /Pages /Kids cycle is detected.
      */
-    protected function _readPages(&$pages, &$result)
+    protected function _readPages(&$pages, &$result, array $visited = array())
     {
+        $parentKey = $this->_pageObjectKey($pages);
+        if ($parentKey !== null) {
+            if (isset($visited[$parentKey])) {
+                throw new pdf_parser_resource_exception(sprintf(
+                    '_readPages cyclic /Pages /Kids chain at object %s', $parentKey
+                ));
+            }
+            $visited[$parentKey] = true;
+        }
+
         // Get the kids dictionary
         $_kids = $this->resolveObject($pages[1][1]['/Kids']);
 
@@ -339,7 +402,7 @@ class fpdi_pdf_parser extends pdf_parser
             if ($pg[1][1]['/Type'][1] === '/Pages') {
                 // If one of the kids is an embedded
                 // /Pages array, resolve it as well.
-                $this->_readPages($pg, $result);
+                $this->_readPages($pg, $result, $visited);
             } else {
                 $result[] = $pg;
             }

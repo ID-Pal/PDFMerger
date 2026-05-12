@@ -8,11 +8,41 @@
  * @version   1.6.1
  */
 
+if (!class_exists('pdf_parser_resource_exception')) {
+    require_once(__DIR__ . '/pdf_parser_exceptions.php');
+}
+
 /**
  * Class pdf_parser
  */
 class pdf_parser
 {
+    /**
+     * Maximum recursion depth permitted in {@see _readValue()}. Bound prevents
+     * pathological dict/array nesting from blowing PHP's call stack or memory.
+     */
+    const MAX_READ_VALUE_DEPTH = 256;
+
+    /**
+     * Maximum recursion depth permitted in {@see resolveObject()}.
+     */
+    const MAX_RESOLVE_DEPTH = 64;
+
+    /**
+     * Maximum number of elements permitted in a single PDF array literal.
+     */
+    const MAX_ARRAY_ELEMENTS = 100000;
+
+    /**
+     * Maximum number of entries permitted in a single PDF dictionary literal.
+     */
+    const MAX_DICT_ENTRIES = 10000;
+
+    /**
+     * Maximum memory delta (current usage minus the value captured at parser
+     * construction) tolerated during a single parse session, in bytes.
+     */
+    const MAX_PARSE_MEMORY_BYTES = 268435456; // 256 MB
     /**
      * Type constant
      *
@@ -168,6 +198,36 @@ class pdf_parser
     protected $_currentObj;
 
     /**
+     * Current recursion depth inside {@see _readValue()}.
+     *
+     * @var int
+     */
+    private $_readValueDepth = 0;
+
+    /**
+     * Current recursion depth inside {@see resolveObject()}.
+     *
+     * @var int
+     */
+    private $_resolveDepth = 0;
+
+    /**
+     * Map of object references currently being resolved, keyed by
+     * "objNum.genNum". Used to detect cycles in {@see resolveObject()}.
+     *
+     * @var array<string, bool>
+     */
+    private $_resolveInFlight = array();
+
+    /**
+     * Resident memory in bytes captured at construction. Used by
+     * {@see _assertBudget()} to detect runaway memory growth during a parse.
+     *
+     * @var int
+     */
+    private $_parseStartMemory = 0;
+
+    /**
      * Constructor
      *
      * @param string $filename Source filename
@@ -190,6 +250,8 @@ class pdf_parser
         }
         $this->_c = new pdf_context($this->_f);
 
+        $this->_parseStartMemory = memory_get_usage(true);
+
         // Read xref-Data
         $this->_xref = array();
         $this->_readXref($this->_xref, $this->_findXref());
@@ -199,6 +261,30 @@ class pdf_parser
 
         // Read root
         $this->_readRoot();
+    }
+
+    /**
+     * Abort the parse if the process has grown beyond
+     * {@see MAX_PARSE_MEMORY_BYTES} since the parser was constructed.
+     *
+     * Called from the recursive value-reading hot paths so that runaway
+     * parses surface as a catchable exception rather than a PHP
+     * `memory_limit` fatal (which is uncatchable by `\Throwable`).
+     *
+     * @param string $context Identifier included in the exception message.
+     * @throws pdf_parser_resource_exception
+     */
+    private function _assertBudget($context)
+    {
+        $delta = memory_get_usage(true) - $this->_parseStartMemory;
+        if ($delta > static::MAX_PARSE_MEMORY_BYTES) {
+            throw new pdf_parser_resource_exception(sprintf(
+                'pdf_parser memory budget exceeded (%s): delta=%d bytes, cap=%d bytes',
+                $context,
+                $delta,
+                static::MAX_PARSE_MEMORY_BYTES
+            ));
+        }
     }
 
     /**
@@ -425,8 +511,38 @@ class pdf_parser
      * @param string $token A token
      * @return mixed
      * @throws Exception
+     * @throws pdf_parser_resource_exception When the recursion depth or the
+     *         parse memory budget is exceeded.
      */
     protected function _readValue(&$c, $token = null)
+    {
+        if (++$this->_readValueDepth > static::MAX_READ_VALUE_DEPTH) {
+            --$this->_readValueDepth;
+            throw new pdf_parser_resource_exception(sprintf(
+                '_readValue recursion depth exceeded %d',
+                static::MAX_READ_VALUE_DEPTH
+            ));
+        }
+
+        try {
+            return $this->_readValueInner($c, $token);
+        } finally {
+            --$this->_readValueDepth;
+        }
+    }
+
+    /**
+     * Inner body of {@see _readValue()} kept separate so the depth-tracking
+     * wrapper can rely on a single entry/exit path via try/finally without
+     * having to instrument every `return` and `throw` in the original switch.
+     *
+     * @param pdf_context $c
+     * @param string $token
+     * @return mixed
+     * @throws Exception
+     * @throws pdf_parser_resource_exception
+     */
+    private function _readValueInner(&$c, $token = null)
     {
         if (is_null($token)) {
             $token = $this->_readToken($c);
@@ -469,12 +585,24 @@ class pdf_parser
                 // This is a dictionary.
 
                 $result = array();
+                $entryCount = 0;
 
                 // Recurse into this function until we reach
                 // the end of the dictionary.
                 while (($key = $this->_readToken($c)) !== '>>') {
                     if ($key === false) {
                         return false;
+                    }
+
+                    if (++$entryCount > static::MAX_DICT_ENTRIES) {
+                        throw new pdf_parser_resource_exception(sprintf(
+                            'PDF dictionary entry count exceeded %d',
+                            static::MAX_DICT_ENTRIES
+                        ));
+                    }
+
+                    if (($entryCount & 0xFF) === 0) {
+                        $this->_assertBudget('readValue:dict');
                     }
 
                     if (($value =   $this->_readValue($c)) === false) {
@@ -496,12 +624,24 @@ class pdf_parser
                 // This is an array.
 
                 $result = array();
+                $elementCount = 0;
 
                 // Recurse into this function until we reach
                 // the end of the array.
                 while (($token = $this->_readToken($c)) !== ']') {
                     if ($token === false) {
                         return false;
+                    }
+
+                    if (++$elementCount > static::MAX_ARRAY_ELEMENTS) {
+                        throw new pdf_parser_resource_exception(sprintf(
+                            'PDF array element count exceeded %d',
+                            static::MAX_ARRAY_ELEMENTS
+                        ));
+                    }
+
+                    if (($elementCount & 0xFFF) === 0) {
+                        $this->_assertBudget('readValue:array');
                     }
 
                     if (($value = $this->_readValue($c, $token)) === false) {
@@ -635,6 +775,8 @@ class pdf_parser
      * @param array $objSpec The object-data
      * @return array|boolean
      * @throws Exception
+     * @throws pdf_parser_resource_exception When an OBJREF cycle is detected
+     *         or the recursion depth exceeds {@see MAX_RESOLVE_DEPTH}.
      */
     public function resolveObject($objSpec)
     {
@@ -645,81 +787,103 @@ class pdf_parser
             return false;
         }
 
-        if ($objSpec[0] == self::TYPE_OBJREF) {
+        if ($objSpec[0] != self::TYPE_OBJREF) {
+            return $objSpec;
+        }
 
+        $cycleKey = $objSpec[1] . '.' . $objSpec[2];
+
+        if (isset($this->_resolveInFlight[$cycleKey])) {
+            throw new pdf_parser_resource_exception(sprintf(
+                'OBJREF cycle detected on object %s', $cycleKey
+            ));
+        }
+
+        if (++$this->_resolveDepth > static::MAX_RESOLVE_DEPTH) {
+            --$this->_resolveDepth;
+            throw new pdf_parser_resource_exception(sprintf(
+                'resolveObject recursion depth exceeded %d',
+                static::MAX_RESOLVE_DEPTH
+            ));
+        }
+
+        $this->_resolveInFlight[$cycleKey] = true;
+
+        try {
             // This is a reference, resolve it
-            if (isset($this->_xref['xref'][$objSpec[1]][$objSpec[2]])) {
-
-                // Save current file position
-                // This is needed if you want to resolve
-                // references while you're reading another object
-                // (e.g.: if you need to determine the length
-                // of a stream)
-
-                $oldPos = $c->getPos();
-
-                // Reposition the file pointer and
-                // load the object header.
-
-                $c->reset($this->_xref['xref'][$objSpec[1]][$objSpec[2]]);
-
-                $header = $this->_readValue($c);
-
-                if ($header[0] != self::TYPE_OBJDEC || $header[1] != $objSpec[1] || $header[2] != $objSpec[2]) {
-                    $toSearchFor = $objSpec[1] . ' ' . $objSpec[2] . ' obj';
-                    if (preg_match('/' . $toSearchFor . '/', $c->buffer)) {
-                        $c->offset = strpos($c->buffer, $toSearchFor) + strlen($toSearchFor);
-                        // reset stack
-                        $c->stack = array();
-                    } else {
-                        throw new Exception(
-                            sprintf("Unable to find object (%s, %s) at expected location.", $objSpec[1], $objSpec[2])
-                        );
-                    }
-                }
-
-                // If we're being asked to store all the information
-                // about the object, we add the object ID and generation
-                // number for later use
-                $result = array (
-                    self::TYPE_OBJECT,
-                    'obj' => $objSpec[1],
-                    'gen' => $objSpec[2]
-                );
-
-                $this->_currentObj =& $result;
-
-                // Now simply read the object data until
-                // we encounter an end-of-object marker
-                while (true) {
-                    $value = $this->_readValue($c);
-                    if ($value === false || count($result) > 4) {
-                        // in this case the parser couldn't find an "endobj" so we break here
-                        break;
-                    }
-
-                    if ($value[0] == self::TYPE_TOKEN && $value[1] === 'endobj') {
-                        break;
-                    }
-
-                    $result[] = $value;
-                }
-
-                $c->reset($oldPos);
-
-                if (isset($result[2][0]) && $result[2][0] == self::TYPE_STREAM) {
-                    $result[0] = self::TYPE_STREAM;
-                }
-
-            } else {
+            if (!isset($this->_xref['xref'][$objSpec[1]][$objSpec[2]])) {
                 throw new Exception(
                     sprintf("Unable to find object (%s, %s) at expected location.", $objSpec[1], $objSpec[2])
                 );
             }
 
+            // Save current file position
+            // This is needed if you want to resolve
+            // references while you're reading another object
+            // (e.g.: if you need to determine the length
+            // of a stream)
+
+            $oldPos = $c->getPos();
+
+            // Reposition the file pointer and
+            // load the object header.
+
+            $c->reset($this->_xref['xref'][$objSpec[1]][$objSpec[2]]);
+
+            $header = $this->_readValue($c);
+
+            if ($header[0] != self::TYPE_OBJDEC || $header[1] != $objSpec[1] || $header[2] != $objSpec[2]) {
+                $toSearchFor = $objSpec[1] . ' ' . $objSpec[2] . ' obj';
+                if (preg_match('/' . $toSearchFor . '/', $c->buffer)) {
+                    $c->offset = strpos($c->buffer, $toSearchFor) + strlen($toSearchFor);
+                    // reset stack
+                    $c->stack = array();
+                } else {
+                    throw new Exception(
+                        sprintf("Unable to find object (%s, %s) at expected location.", $objSpec[1], $objSpec[2])
+                    );
+                }
+            }
+
+            // If we're being asked to store all the information
+            // about the object, we add the object ID and generation
+            // number for later use
+            $result = array (
+                self::TYPE_OBJECT,
+                'obj' => $objSpec[1],
+                'gen' => $objSpec[2]
+            );
+
+            $this->_currentObj =& $result;
+
+            // Now simply read the object data until
+            // we encounter an end-of-object marker
+            while (true) {
+                $value = $this->_readValue($c);
+                if ($value === false || count($result) > 4) {
+                    // in this case the parser couldn't find an "endobj" so we break here
+                    break;
+                }
+
+                if ($value[0] == self::TYPE_TOKEN && $value[1] === 'endobj') {
+                    break;
+                }
+
+                $result[] = $value;
+            }
+
+            $c->reset($oldPos);
+
+            if (isset($result[2][0]) && $result[2][0] == self::TYPE_STREAM) {
+                $result[0] = self::TYPE_STREAM;
+            }
+
+            $this->_assertBudget('resolveObject:' . $cycleKey);
+
             return $result;
-        } else {
-            return $objSpec;
+        } finally {
+            unset($this->_resolveInFlight[$cycleKey]);
+            --$this->_resolveDepth;
         }
     }
 

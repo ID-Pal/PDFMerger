@@ -128,6 +128,18 @@ Desktop.ini
 
 
 #############
+## Composer / PHPUnit
+#############
+
+/vendor/
+composer.lock
+.phpunit.result.cache
+phpunit.xml
+
+# Test fixtures that reference production data are kept out of the repo.
+tests/fixtures/poa_*.pdf
+
+#############
 ## Python
 #############
 
