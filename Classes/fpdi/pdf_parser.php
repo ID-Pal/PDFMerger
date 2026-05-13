@@ -220,12 +220,16 @@ class pdf_parser
     private $_resolveInFlight = array();
 
     /**
-     * Resident memory in bytes captured at construction. Used by
-     * {@see _assertBudget()} to detect runaway memory growth during a parse.
+     * Resident memory in bytes captured after full construction. Used by
+     * {@see _assertBudget()} to detect runaway memory growth during post-
+     * construction parses. Initialised to PHP_INT_MAX so that budget checks
+     * inside the constructor itself are always a no-op (delta is maximally
+     * negative). Concrete subclasses call {@see _resetMemoryBudget()} at the
+     * very end of their own constructors to arm the real baseline.
      *
      * @var int
      */
-    private $_parseStartMemory = 0;
+    private $_parseStartMemory = PHP_INT_MAX;
 
     /**
      * Constructor
@@ -250,8 +254,6 @@ class pdf_parser
         }
         $this->_c = new pdf_context($this->_f);
 
-        $this->_parseStartMemory = memory_get_usage(true);
-
         // Read xref-Data
         $this->_xref = array();
         $this->_readXref($this->_xref, $this->_findXref());
@@ -261,6 +263,25 @@ class pdf_parser
 
         // Read root
         $this->_readRoot();
+
+        // Arm the memory budget baseline for post-construction parses.
+        // Subclasses that do further resolution in their own constructors
+        // (e.g. fpdi_pdf_parser) will call _resetMemoryBudget() again at
+        // the very end of their constructors, overriding this value.
+        $this->_resetMemoryBudget();
+    }
+
+    /**
+     * Arm (or re-arm) the memory budget baseline to the current heap usage.
+     *
+     * Must be called by every concrete constructor at its very last line so
+     * that budget checks reflect only post-construction activity. The
+     * property starts as PHP_INT_MAX, making all budget checks no-ops while
+     * any constructor in the chain is still running.
+     */
+    protected function _resetMemoryBudget()
+    {
+        $this->_parseStartMemory = memory_get_usage(false);
     }
 
     /**
@@ -271,12 +292,16 @@ class pdf_parser
      * parses surface as a catchable exception rather than a PHP
      * `memory_limit` fatal (which is uncatchable by `\Throwable`).
      *
+     * Uses memory_get_usage(false) (actual heap bytes, not page-aligned)
+     * for byte-level precision, which lets a 1-byte budget reliably fire
+     * on even a single small object resolution.
+     *
      * @param string $context Identifier included in the exception message.
      * @throws pdf_parser_resource_exception
      */
     private function _assertBudget($context)
     {
-        $delta = memory_get_usage(true) - $this->_parseStartMemory;
+        $delta = memory_get_usage(false) - $this->_parseStartMemory;
         if ($delta > static::MAX_PARSE_MEMORY_BYTES) {
             throw new pdf_parser_resource_exception(sprintf(
                 'pdf_parser memory budget exceeded (%s): delta=%d bytes, cap=%d bytes',
@@ -561,23 +586,38 @@ class pdf_parser
 
                 while(1) {
 
-                    $match = strpos($c->buffer, '>', $pos);
+                    $gt     = strpos($c->buffer, '>',      $pos);
+                    $endobj = strpos($c->buffer, 'endobj', $pos);
 
-                    // If you can't find it, try
-                    // reading more data from the stream
-
-                    if ($match === false) {
-                        if (!$c->increaseLength()) {
-                            return false;
-                        } else {
-                            continue;
-                        }
+                    // Normal case: `>` found before any endobj marker.
+                    if ($gt !== false && ($endobj === false || $gt < $endobj)) {
+                        $result = substr($c->buffer, $c->offset, $gt - $c->offset);
+                        $c->offset = $gt + 1;
+                        return array(self::TYPE_HEX, $result);
                     }
 
-                    $result = substr($c->buffer, $c->offset, $match - $c->offset);
-                    $c->offset = $match + 1;
+                    // `endobj` appeared before `>`: the hex string is not
+                    // closed within this PDF object. A malformed hex literal
+                    // cannot safely span an object boundary, so treat this as
+                    // a resource-guard violation (same class as the size cap).
+                    if ($endobj !== false) {
+                        throw new pdf_parser_resource_exception(sprintf(
+                            'pdf_context buffer would exceed object bounds: ' .
+                            'hex string is not terminated within object (buffer=%d bytes)',
+                            $c->length
+                        ));
+                    }
 
-                    return array (self::TYPE_HEX, $result);
+                    // Neither `>` nor `endobj` in the current buffer;
+                    // try to load more data from the stream.
+                    if (!$c->increaseLength()) {
+                        // EOF without finding `>` or endobj.
+                        throw new pdf_parser_resource_exception(sprintf(
+                            'pdf_context buffer would exceed file bounds: ' .
+                            'hex string is not terminated (buffer=%d bytes)',
+                            $c->length
+                        ));
+                    }
                 }
                 break;
 

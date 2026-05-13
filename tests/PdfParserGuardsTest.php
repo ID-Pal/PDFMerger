@@ -176,11 +176,15 @@ class PdfParserGuardsTest extends TestCase
     {
         // Open the hex literal but never close it. The parser keeps growing
         // the buffer searching for `>` until the cap kicks in.
+        // Object 4 has an opening `<` for a hex string with no matching `>`,
+        // so the parser must grow its read buffer until EOF fires the guard.
+        // The body intentionally omits any `>` character so the hex literal
+        // is genuinely unterminated.
         $pdf = (new MinimalPdfBuilder())
             ->addObject(1, '<< /Type /Catalog /Pages 2 0 R /Hex 4 0 R >>')
             ->addObject(2, '<< /Type /Pages /Kids [3 0 R] /Count 1 >>')
             ->addObject(3, '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>')
-            ->addObject(4, '<< /X <' . str_repeat('A', 1024) . ' >>')
+            ->addObject(4, '<< /X <' . str_repeat('A', 1024))
             ->setRoot(1)
             ->writeToTempFile();
         $this->tempFiles[] = $pdf;

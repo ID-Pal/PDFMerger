@@ -71,6 +71,12 @@ class fpdi_pdf_parser extends pdf_parser
         
         // count pages;
         $this->_pageCount = count($this->_pages);
+
+        // Re-arm the budget baseline now that all construction (including
+        // page-tree resolution) is complete. This ensures that budget checks
+        // only fire for post-construction caller activity, not for the work
+        // done inside the constructor chain itself.
+        $this->_resetMemoryBudget();
     }
     
     /**
