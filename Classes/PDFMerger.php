@@ -32,6 +32,9 @@ class PDFMerger
      */
     public function __construct()
     {
+        if (!class_exists('pdf_parser_resource_exception')) {
+            require_once(__DIR__ . '/fpdi/pdf_parser_exceptions.php');
+        }
         if(!class_exists("FPDF")) {
             require_once('fpdf/fpdf.php');
         }

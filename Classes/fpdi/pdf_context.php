@@ -8,11 +8,23 @@
  * @version   1.6.1
  */
 
+if (!class_exists('pdf_parser_resource_exception')) {
+    require_once(__DIR__ . '/pdf_parser_exceptions.php');
+}
+
 /**
  * Class pdf_context
  */
 class pdf_context
 {
+    /**
+     * Maximum number of bytes the read buffer is allowed to hold. Prevents a
+     * malformed PDF (for example a hex string without a closing `>`) from
+     * causing {@see increaseLength()} to grow the buffer until PHP's
+     * `memory_limit` fatal kills the process.
+     */
+    const MAX_BUFFER_BYTES = 16777216; // 16 MB
+
     /**
      * Mode
      *
@@ -121,6 +133,8 @@ class pdf_context
      *
      * @param int $l
      * @return bool
+     * @throws pdf_parser_resource_exception When growing the buffer would
+     *         exceed {@see MAX_BUFFER_BYTES}.
      */
     public function increaseLength($l = 100)
     {
@@ -128,6 +142,14 @@ class pdf_context
             return false;
         } else if ($this->_mode == 0) {
             $totalLength = $this->length + $l;
+            if ($totalLength > self::MAX_BUFFER_BYTES) {
+                throw new pdf_parser_resource_exception(sprintf(
+                    'pdf_context buffer would exceed %d bytes (current=%d, requested=%d)',
+                    self::MAX_BUFFER_BYTES,
+                    $this->length,
+                    $l
+                ));
+            }
             do {
                 $toRead = $totalLength - $this->length;
                 if ($toRead < 1)
